@@ -26,6 +26,175 @@
 
 #require "libchatbot.js"
 
+
+// -------------------------------------------------------------------
+// !FUNCTIONS IN THIS AREA COULD/SHOULD BE MOVED TO A LIBRARY
+
+/*
+ * Read registered subscribers and last allocated tmsi. Should be called when script is started.
+ * Function calls other functions based on tmsi_storage configuration to read users from various mediums: conf file/db
+ */
+function readUEs()
+{
+    if (tmsi_storage==undefined || tmsi_storage=="conf")
+	readUEsFromConf();
+}
+
+/*
+ * Read registered subscribers from tmsidata.conf configuration file and last allocated tmsi
+ */
+function readUEsFromConf()
+{
+    conf = new ConfigFile(Engine.configFile("tmsidata"),true);
+
+    tmsisection = conf.getSection("tmsi",true);
+    last_tmsi = tmsisection.getValue("last");
+
+    ues = conf.getSection("ues",true);
+    var subscriber_info, imsi;
+    registered_subscribers = {};
+
+    keys = ues.keys();
+    var count_ues = 0;
+    for (imsi of keys) {
+	// Ex:226030182676743=000000bd,354695033561290,,1401097352
+	// imsi=tmsi,imei,msisdn,expires
+	subscriber_info = ues.getValue(imsi);
+	subscriber_info = subscriber_info.split(",");
+	var tmsi = subscriber_info[0];
+	var imei = subscriber_info[1];
+	var msisdn = subscriber_info[2];
+	var expires = subscriber_info[3];
+	var expires = parseInt(expires);
+	var loc = subscriber_info[4];
+	registered_subscribers[imsi] = {"tmsi":tmsi,"imei":imei,"msisdn":msisdn,"expires":expires,"location":loc};
+	count_ues = count_ues+1;
+    }
+
+    Engine.debug(Engine.DebugInfo, "Finished reading saved registered subscribers. Found "+count_ues+" registered_subscribers.");
+}
+
+/*
+ * Check if modification were actually made and save modifications to registered subscribers storage
+ * Function calls other functions based on tmsi_storage configuration to write registered_subscribers to various mediums: conf file/db
+ * @param imsi String
+ * @param subscriber Object/undefined. If undefined them subscriber must be deleted
+ */
+function saveUE(imsi,subscriber)
+{
+    if (subscriber!=undefined) {
+	if (subscriber[imsi]!=undefined) {
+	    Engine.print_r(registered_subscribers);	   
+	    if (subscriber == registered_subscribers[imsi]) {
+		Engine.Debug(Engine.DebugInfo, "No change when updating subscriber info for IMSI "+imsi);
+		return;
+	    }
+	}
+    }
+
+    if (tmsi_storage==undefined || tmsi_storage=="conf")
+	saveUEinConf(imsi,subscriber)
+}
+
+/*
+ * Save modifications to registered_subscribers in tmsidata.conf configuration file 
+ * @param imsi String
+ * @param subscriber Object/undefined. If undefined them subscriber must be deleted
+ */
+function saveUEinConf(imsi,subscriber)
+{
+    if (subscriber!=undefined) {
+	var fields = subscriber["tmsi"]+","+subscriber["imei"]+","+subscriber["msisdn"]+","+subscriber["expires"];
+	conf.setValue(ues,imsi,fields);
+    } else
+	conf.clearKey(ues,imsi);
+
+    if (conf.save()==false)
+	Engine.alarm(4, "Could not save tmsi in tmsidata.conf");
+}
+
+function saveTMSI(tmsi)
+{
+    if (tmsi_storage==undefined || tmsi_storage=="conf")
+	saveTMSIinConf(tmsi);
+}
+
+function saveTMSIinConf(tmsi)
+{
+    conf.setValue(tmsisection,"last",tmsi);
+    if (conf.save()==false)
+	Engine.alarm(4, "Could not save last tmsi in tmsidata.conf");
+}
+
+/*
+ * Update registered_subscribers in memory and on storage medium
+ * @param msg Object when to take subscriber parameters from
+ */
+function updateSubscribers(msg)
+{
+    var imsi = msg.imsi;
+    if (imsi=="") {
+	// this should not happen. If it does => BUG
+	Engine.debug(Engine.debugWarn, "ERROR: got updateSubscribers with msg without imsi. tmsi='"+msg.tmsi+"'");
+	return;
+    }
+
+    var imei = msg.imei;
+    if (imei=="" && registered_subscribers[imsi]!=undefined)
+	imei = registered_subscribers[imsi]["imei"];
+
+    var expire_subscriber = Date.now()/1000 + imsi_cleanup;
+    subscriber = {"tmsi":msg.tmsi, "msisdn":msg.msisdn, "imei":imei, "expires":expire_subscriber};
+    registered_subscribers[imsi] = subscriber;
+    saveUE(imsi,subscriber);
+}
+
+/**
+ * Make sure both imsi and tmsi are set in routing messages
+ * @param msg Object represent the routing message
+ * @param imsi String
+ */
+function addRoutingParams(msg,imsi)
+{
+    msg.imsi = imsi;
+    msg.tmsi = subscribers[imsi]["tmsi"];
+}
+
+function initNnsf()
+{
+    if (nnsf_bits > 0 && nnsf_bits <= 10) {
+	nnsf_node &= 0x03ff >> (10 - nnsf_bits);
+	nnsf_node_mask = (0xffc000 << (10 - nnsf_bits)) & 0xffc000;
+	nnsf_node_shift = nnsf_node << (24 - nnsf_bits);
+	nnsf_local_mask = 0xffffff >> nnsf_bits;
+    }
+    else {
+	nnsf_bits = 0;
+	nnsf_node = 0;
+	nnsf_node_mask = 0;
+	nnsf_node_shift = 0;
+	nnsf_local_mask = 0xffffff;
+    }
+}
+
+// Create a candidate new TMSI taking into account node selection function
+function newTmsi()
+{
+    var t = last_tmsi;
+    if (t)
+	t = 1 * parseInt(t,16);
+    else
+	t = 0;
+    if (nnsf_bits > 0)
+	t = ((t & 0xff000000) >> nnsf_bits) | (t & nnsf_local_mask);
+    t++;
+    if (nnsf_bits > 0)
+	t = ((t << nnsf_bits) & 0xff000000) | nnsf_node_shift | (t & nnsf_local_mask);
+    if ((t & 0xc0000000) == 0xc0000000)
+	t = nnsf_node_shift + 1;
+    return last_tmsi = t.toString(16,8);
+}
+
 // Helper that returns a left or right aligned fixed length string
 function strFix(str,len,pad)
 {
@@ -50,6 +219,40 @@ function strFix(str,len,pad)
     }
     return str;
 }
+
+function getConfigurationObject(file)
+{
+    if (file.substr(-4)!=".conf")
+	file = Engine.configFile(file);
+
+    var conf = new ConfigFile(file,true);
+    var sections = conf.sections();
+    var section, section_name, prop_name, keys;
+    var configuration = {};
+
+    for (section_name in sections) {
+	section = conf.getSection(section_name);
+	configuration[section_name] = {};
+	keys = section.keys();
+	for (prop_name of keys)
+	    configuration[section_name][prop_name] = section.getValue(prop_name);
+    }
+    return configuration;
+}
+ 
+function randomint(modulus)
+{
+    if (randomint.count==undefined) {
+	var d = new Date();
+	randomint.count = d.getSeconds()*1000 + d.getMilliseconds();
+    }
+    randomint.count++;
+    // Knuth's integer hash.
+    var hash =(randomint.count * 2654435761) % 4294967296;
+    return hash % modulus;
+}
+
+// -------------------------------------------------------------------------------
 
 function updateSubscribersInfo()
 {
@@ -133,6 +336,17 @@ function readConfiguration(return_subscribers)
     regexp = new RegExp(reg);
     var upd_subscribers = configuration;
 
+    if (configuration["general"]["nnsf_bits"]!="")
+	nnsf_bits = configuration["general"]["nnsf_bits"];
+    else
+	nnsf_bits = def_nnsf_bits;
+
+    if (configuration["general"]["nnsf_node"]!="")
+	nnsf_node = configuration["general"]["nnsf_node"];
+    else
+	nnsf_node = def_nnsf_node;
+    initNnsf();
+
     delete upd_subscribers["general"];
 
     if (upd_subscribers.length==0 && regexp==undefined)
@@ -157,37 +371,25 @@ function readConfiguration(return_subscribers)
     if (count>0)
     	subscribers = upd_subscribers;
 }
-
-function getConfigurationObject(file)
-{
-    if (file.substr(-4)!=".conf")
-	file = Engine.configFile(file);
-
-    var conf = new ConfigFile(file,true);
-    var sections = conf.sections();
-    var section, section_name, prop_name, keys;
-    var configuration = {};
-
-    for (section_name in sections) {
-	section = conf.getSection(section_name);
-	configuration[section_name] = {};
-	keys = section.keys();
-	for (prop_name of keys)
-	    configuration[section_name][prop_name] = section.getValue(prop_name);
-    }
-    return configuration;
-}
  
-function randomint(modulus)
+// Allocate an unused TMSI
+function allocTmsi()
 {
-    if (randomint.count==undefined) {
-	var d = new Date();
-	randomint.count = d.getSeconds()*1000 + d.getMilliseconds();
+    var imsi_key, tmsi, in_use;
+
+    for (;;) {
+	tmsi = newTmsi();
+	in_use = false;
+	for (imsi_key in registered_subscribers) {
+	    if (registered_subscribers[imsi_key]==tmsi) {
+		in_use = true;
+		break;
+	    }
+	}
+	if (in_use)
+	    continue;
+	saveTMSI(tmsi);
     }
-    randomint.count++;
-    // Knuth's integer hash.
-    var hash =(randomint.count * 2654435761) % 4294967296;
-    return hash % modulus;
 }
 
 function rand32()
@@ -277,11 +479,16 @@ function goodNumber()
 
 function getRegUserMsisdn(imsi)
 {
-    var msisdn_key;
+/*  var msisdn_key;
 
     for (msisdn_key in regUsers)
 	if (regUsers[msisdn_key] == imsi)
 	    return msisdn_key;
+    return false;*/
+
+    if (registered_subscribers[imsi]!="")
+	return registered_subscribers[imsi]["msisdn"];
+
     return false;
 }
 
@@ -302,6 +509,42 @@ function getSubscriberMsisdn(imsi)
     return false;
 }
 
+function getSubscriberIMSI(msisdn,tmsi)
+{
+    var imsi_key, nr, short_number, user_tmsi;
+
+    if (msisdn) {
+	for (imsi_key in subscribers) {
+	    nr = subscribers[imsi_key].msisdn;
+	    if (nr.length>0) {
+		// strip + from start of number
+		if (nr.substr(0,1)=="+")
+		    nr = nr.substr(1);
+
+		//if (nr==msisdn || nr.substr(0,msisdn.length)==msisdn || (msisdn.substr(0,1)=="+" && msisdn.substr(1,nr.length)==nr))
+		if (msisdn.substr(-nr.length)==nr)
+		    return imsi_key;
+	    }
+
+	    short_number = subscribers[imsi_key].short_number;
+	    if (short_number.length>0) 
+		if (short_number==msisdn)
+		    return imsi_key;
+	}
+    }
+    else if (tmsi) {
+	for (imsi_key in registered_subscribers) {
+	    user_tmsi = registered_subscribers[imsi_key].tmsi;
+	    if (user_tmsi==tmsi) {
+		return imsi_key;
+	    }
+	}
+    }
+    
+
+    return false;
+}
+/*
 function getSubscriberIMSI(msisdn)
 {
     var imsi_key, nr, short_number;
@@ -325,7 +568,7 @@ function getSubscriberIMSI(msisdn)
     }
 
     return false;
-}
+}*/
 
 function getRouteToMsisdn(called)
 {
@@ -772,17 +1015,31 @@ function onAuth(msg)
 
 function onRegister(msg)
 {
-    var imsi = msg.username;
-    var posib_msisdn = msg.msisdn;
+    // don't look at user.register from other modules besides ybts
+    if (msg.driver!="ybts")
+	return false;
 
-    if (imsi=="") {
+    var imsi = msg.imsi;
+    var tmsi = msg.tmsi;
+
+    if (tmsi!="" && imsi=="") {
+	imsi = getSubscriberIMSI(null,tmsi);
+	if (imsi==false) {
+	    msg.askimsi = true;
+	    msg.askimei = true;
+	    return false;
+	}
+    } else if (imsi=="") {
 	// this should not happen
-	Engine.debug(Engine.DebugWarn,"Got user.register with NULL username(imsi).");
+	Engine.debug(Engine.DebugWarn,"Got user.register with empty imsi and tmsi.");
 	return false;
     }
 
+    Engine.debug(Engine.DebugInfo, "Got user.register for imsi='"+imsi+"', tmsi='"+tmsi+"'");
+
     if (subscribers != undefined) {
 	Engine.debug(Engine.DebugInfo,"Searching imsi in subscribers.");
+
 	msisdn = getSubscriberMsisdn(imsi);
 
 	if (subscribers[imsi] != "") {
@@ -805,29 +1062,23 @@ function onRegister(msg)
 	    // check if imsi is already registered so we don't allocate a new number
 	    msisdn = alreadyRegistered(imsi);
 	    if (msisdn==false) {
-
-		if (posib_msisdn!="")
-		    if (numberAvailable(posib_msisdn))
-			msisdn = posib_msisdn;
-
-		if (msisdn==false) {
-		    Engine.debug(Engine.DebugInfo,"Located imsi without msisdn. Allocated random number");
-		    msisdn = newNumber(imsi);
-		    //sendGreetingMessage(imsi, msisdn);
-		}
+		Engine.debug(Engine.DebugInfo,"Located imsi without msisdn. Allocated random number");
+		msisdn = newNumber(imsi);
 	    }
 	} else if (msisdn==false) {
+	    // IMSI is not allowed
 	    addRejected(imsi);
-	    msg.error = "forbidden";
+	    msg.error = "IMSI-unknown-in-HLR";
 	    return false;
 	}
+
     } else {
 	if (regexp == undefined) {
 	    Engine.alarm(alarm_conf,"Please configure accepted subscribers or regular expression to accept by.");
 
 	    // maybe reject everyone until system is configured ??
 	    // addRejected(imsi);
-	    msg.error = "forbidden";
+	    msg.error = "network-failure";
 	    return false;
 	} else {
 	    // check that imsi is valid against regexp
@@ -836,34 +1087,32 @@ function onRegister(msg)
 		// check if imsi is already registered so we don't allocate a new number
 		msisdn = alreadyRegistered(imsi);
 		if (msisdn==false) {
-		    if (posib_msisdn!="")
-			if (numberAvailable(posib_msisdn))
-			     msisdn = posib_msisdn;
-
-		    if (msisdn==false) {
-		        Engine.debug(Engine.DebugInfo,"Allocated random number");
-		        msisdn = newNumber(imsi);
-		        //sendGreetingMessagie(imsi, msisdn);
-		    }
+		    Engine.debug(Engine.DebugInfo,"Allocated random number");
+		    msisdn = newNumber(imsi);
 		}
 	    } else {
 		addRejected(imsi);
-		msg.error = "forbidden";
+		msg.error = "IMSI-unknown-in-HLR";
 		return false;
 	    }
 	}
     }
 
+    if (tmsi=="")
+	msg.tmsi = allocTmsi();
+
     if (alreadyRegistered(imsi)==false)
 	sendGreetingMessage(imsi, msisdn);
-    
-    if (msisdn.substr(0,1)!="+")
-	msisdn = "+"+msisdn;
 
-    // if we do this, in the future it will be copied in call.route messages(after this is implemented in ybts.cpp)
     msg.msisdn = msisdn;
+    
+//    if (msisdn.substr(0,1)!="+")
+//	msisdn = "+"+msisdn;
 
-    regUsers[msisdn] = imsi;
+//    regUsers[msisdn] = imsi;
+
+    updateSubscribers(msg);
+
     Engine.debug(Engine.DebugInfo,"Registered imsi "+imsi+" with number "+msisdn);
     return true;
 }
@@ -886,6 +1135,11 @@ function onUnregister(msg)
     delete regUsers[msisdn];
 
     Engine.debug(Engine.DebugInfo,"Unregistered imsi "+imsi+" with msisdn "+msisdn);
+
+    // Don't delete subscribers when unregistering. We'll mark them as expired
+    //delete subscribers[imsi];
+    //saveUE(imsi);
+
     return true;
 }
 
@@ -977,6 +1231,8 @@ var pendingSMSs = [];
 var seenIMSIs = {};  // imsi:count_rejected
 var ussd_sessions = {};
 var alarm_conf = 3;
+var def_nnsf_bits = 8;
+var def_nnsf_node = 123;
 
 Engine.debugName("nib");
 Message.install(onUnregister,"user.unregister",80);
