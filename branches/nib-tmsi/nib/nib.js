@@ -57,8 +57,9 @@ function readUEsFromConf()
     keys = ues.keys();
     var count_ues = 0;
     for (imsi of keys) {
-	// Ex:226030182676743=000000bd,354695033561290,,1401097352
-	// imsi=tmsi,imei,msisdn,expires
+	// Ex   registered user:226030182676743=000000bd,354695033561290,40121212121,1401097352,ybts/TMSI000000bd
+	// Ex unregistered user:226030182676743=000000bd,354695033561290,40121212121,1401097352,
+	// imsi=tmsi,imei,msisdn,expires,location
 	subscriber_info = ues.getValue(imsi);
 	subscriber_info = subscriber_info.split(",");
 	var tmsi = subscriber_info[0];
@@ -92,6 +93,7 @@ function saveUE(imsi,subscriber)
 	}
     }
 
+    registered_subscribers[imsi] = subscriber;
     if (tmsi_storage==undefined || tmsi_storage=="conf")
 	saveUEinConf(imsi,subscriber)
 }
@@ -127,15 +129,16 @@ function saveTMSIinConf(tmsi)
 }
 
 /*
- * Update registered_subscribers in memory and on storage medium
- * @param msg Object when to take subscriber parameters from
+ * Update subscriber after registration in registered_subscribers in memory and on storage medium
+ * @param msg Object where to take subscriber parameters from
+ * @param loc String location where calls/smss should be routed for this subscriber
  */
-function updateSubscribers(msg)
+function registerSubscriber(msg,loc)
 {
     var imsi = msg.imsi;
     if (imsi=="") {
 	// this should not happen. If it does => BUG
-	Engine.debug(Engine.debugWarn, "ERROR: got updateSubscribers with msg without imsi. tmsi='"+msg.tmsi+"'");
+	Engine.debug(Engine.debugWarn, "ERROR: got registerSubscriber with msg without imsi. tmsi='"+msg.tmsi+"'");
 	return;
     }
 
@@ -145,7 +148,21 @@ function updateSubscribers(msg)
 
     var expire_subscriber = Date.now()/1000 + imsi_cleanup;
     subscriber = {"tmsi":msg.tmsi, "msisdn":msg.msisdn, "imei":imei, "expires":expire_subscriber};
-    registered_subscribers[imsi] = subscriber;
+    if (loc=="")
+	subscriber["location"] = "ybts/TMSI"+msg.tmsi;
+    else
+	subscriber["location"] = loc;
+
+    saveUE(imsi,subscriber);
+}
+
+function unregisterSubscriber(imsi)
+{
+    if (registered_subscribers[imsi]=="")
+	return;
+
+    var subscriber = registered_subscribers[imsi];
+    delete subscriber["location"];
     saveUE(imsi,subscriber);
 }
 
@@ -267,18 +284,18 @@ function rand128()
 
 function updateSubscribersInfo()
 {
-    var msisdn, imsi;
+    var imsi;
     var upd_subscribers = readConfiguration(true);
 
     if (upd_subscribers.length==0 && regexp!=undefined) {
 	// we moved from accepting individual subscribers to accepting them by regexp
 	// remove all registered users that don't match new regexp
-	
-	for (msisdn in regUsers) {
-		imsi = regUsers[msisdn];
-		if (!imsi.match(regexp))
-			delete regUsers[msisdn];
+
+	for (imsi in registered_subscribers) {
+	    if (!imsi.match(regexp))
+		unregisterSubscriber(imsi);
 	}
+
 	if (subscribers!=undefined)
 	    delete subscribers;
 	return; 
@@ -293,12 +310,10 @@ function updateSubscribersInfo()
 
     for (imsi in subscribers) {
 	if (subscribers[imsi]["updated"]!=true) {
-	    msisdn = alreadyRegistered(imsi);
-	    if (msisdn) {
-		delete regUsers[msisdn];
-	    }
+	    if (alreadyRegistered(imsi)) 
+		unregisterSubscriber(imsi);
+
 	    delete subscribers[imsi];
-	    
 	}
 
 	// clear updated field after checking it
@@ -312,17 +327,16 @@ function updateSubscriber(fields, imsi)
 
     if (subscribers[imsi]!=undefined) {
 	if (subscribers[imsi]["active"]==true && fields["active"]!=true) {
-	    // subscriber was deactivated. make sure to delete it from regUsers
-	    for (var msisdn in regUsers)
-		if (regUsers[msisdn]==imsi)
-		    delete regUsers[msisdn];
+	    // subscriber was deactivated. make sure to clean location from registered_subscribers
+	    if (registered_subscribers[imsi]!="" && registered_subscribers[imsi]["location"]!="") 
+		unregisterSubscriber(imsi);
 	} else if (subscribers[imsi]["msisdn"]!=fields["msisdn"]) {
 	    // subscriber msisdn was changed. Try to keep registration
-	    for (var msisdn in regUsers)
-		if (regUsers[msisdn]==imsi) {
-		    regUsers[fields["msisdn"]] = regUsers[subscribers[imsi]["msisdn"]];
-		    delete regUsers[subscribers[imsi]["msisdn"]];
-		}
+	    if (registered_subscribers[imsi]!="") {
+		var subscriber = registered_subscribers[imsi];
+		subscriber["msisdn"] = fields["msisdn"];
+		saveUE(imsi,subscriber);
+	    }
 	}
     }
 
@@ -332,7 +346,7 @@ function updateSubscriber(fields, imsi)
     for (var field_name of fields_to_update)
 	subscribers[imsi][field_name] = fields[field_name];
     
-     subscribers[imsi]["updated"] = true;
+    subscribers[imsi]["updated"] = true;
 }
 
 function readConfiguration(return_subscribers)
@@ -499,7 +513,6 @@ function alreadyRegistered(imsi)
 function getSubscriberMsisdn(imsi)
 {
     if (subscribers[imsi]!=undefined) {
-	// what happens if user didn't set msisdn ??
 	if (subscribers[imsi].active)
 	    return subscribers[imsi].msisdn;
 	else
@@ -574,17 +587,19 @@ function isShortNumber(called)
 	    msisdn = getRegUserMsisdn(imsi_key);
 	    if (msisdn!=false)
 		return msisdn;
-	    // this is the short number for an offline user
+	    // this is the short number for an offline user that doesn't have a msisdn associated in subscribers
 	    // bad luck
+	    if (registered_subscribers[imsi_key]!="")
+		return registered_subscribers[imsi_key].msisdn;
 	}
     }
 
     return called;
 }
 
-function routeOutside(msg,called)
+function routeOutside(msg)
 {
-    if (called.substr(0,1)!="+")
+    if (msg.callednumtype=="international")
 	msg.called = "+"+msg.called;
 
     msg.line = "outbound";
@@ -1107,9 +1122,7 @@ function onRegister(msg)
 //    if (msisdn.substr(0,1)!="+")
 //	msisdn = "+"+msisdn;
 
-//    regUsers[msisdn] = imsi;
-
-    updateSubscribers(msg);
+    registerSubscriber(msg);
 
     Engine.debug(Engine.DebugInfo,"Registered imsi "+imsi+" with number "+msisdn);
     return true;
@@ -1127,10 +1140,8 @@ function onUnregister(msg)
     if (imsi=="")
 	return false;
 
-    // Don't delete subscribers when unregistering, clean location. We'll mark them as expired
-    delete registered_subscribers[imsi]["location"];
-    saveUE(imsi);
-    Engine.debug(Engine.DebugInfo,"Unregistered imsi "+imsi);
+    unregisterSubscriber(imsi)
+    Engine.debug(Engine.DebugInfo,"finished onUnregister imsi "+imsi);
 
     return true;
 }
@@ -1184,8 +1195,8 @@ function onCommand(msg)
 	case "nib list registered":
 	    var tmp = "IMSI            MSISDN \r\n";
 	    tmp += "--------------- ---------------\r\n";
-	    for (var msisdn_key in regUsers)
-		tmp += regUsers[msisdn_key]+"   "+msisdn_key+"\r\n";
+	    for (var imsi_key in registered_subscribers)
+		tmp += imsi_key+"   "+registered_subscribers[imsi_key]["msisdn"]+"\r\n";
 	    msg.retValue(tmp);
 	    return true;
 
@@ -1218,7 +1229,7 @@ var eliza_number = "35492";
 var david_number = "32843";
 var nib_smsc_number = "12345";
 var sms_attempts = 3;
-var regUsers = {};
+var registered_subscribers = {};
 var pendingSMSs = [];
 var seenIMSIs = {};  // imsi:count_rejected
 var ussd_sessions = {};
