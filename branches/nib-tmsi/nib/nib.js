@@ -685,11 +685,11 @@ function onIdleAction()
 	    // make sure destination subscriber is registered
 	    var loc = registered_subscribers[sms.dest_imsi]["location"];
 	    if (loc=="") {
-		sms.next_try = (Date.now() / 1000) + 60; // current time + 60 seconds 
+		sms.next_try = (Date.now() / 1000) + 300; // current time + 5 minutes
 		pendingSMSs.push(sms);
-		Engine.debug(Engine.DebugInfo,"Could not deliver sms from imsi "+sms.imsi+" to number "+sms.dest+" because destination is offline.");
+		Engine.debug(Engine.DebugInfo,"Could not deliver sms from imsi "+sms.imsi+" to number "+sms.dest+" because destination is offline. Waiting 5 minutes before trying again.");
 
-		// Reschedule after 2s
+		// Reschedule after 5s
 		onInterval.nextIdle = (Date.now() / 1000) + 5;
 		return;
 	    }
@@ -1039,6 +1039,11 @@ function checkAuth(msg,imsi,is_auth)
 
 function onAuth(msg)
 {
+    if (subscribers==undefined) {
+	Engine.debug(Engine.DebugWarn, "MT auth is set, but subscribers are not defined. You can't authentify MT calls/SMSs when regexp is defined is defined in subscribers.conf.");
+	return true;
+    }
+
     var imsi = msg.imsi;
     var tmsi = msg.tmsi;
 
