@@ -147,7 +147,7 @@ function registerSubscriber(msg,loc)
     var imsi = msg.imsi;
     if (imsi=="") {
 	// this should not happen. If it does => BUG
-	Engine.debug(Engine.debugWarn, "ERROR: got registerSubscriber with msg without imsi. tmsi='"+msg.tmsi+"'");
+	Engine.debug(Engine.DebugWarn, "ERROR: got registerSubscriber with msg without imsi. tmsi='"+msg.tmsi+"'");
 	return;
     }
 
@@ -384,6 +384,11 @@ function readConfiguration(return_subscribers)
 	nnsf_node = def_nnsf_node;
     initNnsf();
 
+    if (configuration["general"]["imsi_cleanup"]!="")
+	imsi_cleanup = configuration["general"]["imsi_cleanup"];
+    else
+	imsi_cleanup = 3600 * 24 * 7;
+
     delete upd_subscribers["general"];
 
     if (upd_subscribers.length==0 && regexp==undefined)
@@ -548,7 +553,7 @@ function getSubscriberIMSI(msisdn,tmsi)
 
     if (msisdn) {
 	for (imsi_key in subscribers) {
-	    nr = subscribers[imsi_key].msisdn;
+	    nr = subscribers[imsi_key]["msisdn"];
 	    if (nr.length>0) {
 		// strip + from start of number
 		if (nr.substr(0,1)=="+")
@@ -559,11 +564,25 @@ function getSubscriberIMSI(msisdn,tmsi)
 		    return imsi_key;
 	    }
 
-	    short_number = subscribers[imsi_key].short_number;
+	    short_number = subscribers[imsi_key]["short_number"];
 	    if (short_number.length>0) 
 		if (short_number==msisdn)
 		    return imsi_key;
 	}
+
+	for (imsi_key in registered_subscribers) {
+	    nr = registered_subscribers[imsi_key]["msisdn"];
+	    if (nr.length>0) {
+		// strip + from start of number
+		if (nr.substr(0,1)=="+")
+		    nr = nr.substr(1);
+
+		//if (nr==msisdn || nr.substr(0,msisdn.length)==msisdn || (msisdn.substr(0,1)=="+" && msisdn.substr(1,nr.length)==nr))
+		if (msisdn.substr(-nr.length)==nr)
+		    return imsi_key;
+	    }
+	}
+
     }
     else if (tmsi) {
 	for (imsi_key in registered_subscribers) {
@@ -675,43 +694,61 @@ function onInterval()
 // Execute idle loop actions
 function onIdleAction()
 {
+    var now = Date.now()/1000;
+    var sms;
+
     // check if we have any SMSs to send
-    if (pendingSMSs.length>0) {
-	// check if sms from first position is ready to be delivered
-	if (pendingSMSs[0].next_try<=Date.now()) {
-	    // retrieve sms from first position and remove it
-	    var sms = pendingSMSs.shift();
-
-	    // make sure destination subscriber is registered
-	    var loc = registered_subscribers[sms.dest_imsi]["location"];
-	    if (loc=="") {
-		sms.next_try = (Date.now() / 1000) + 300; // current time + 5 minutes
-		pendingSMSs.push(sms);
-		Engine.debug(Engine.DebugInfo,"Could not deliver sms from imsi "+sms.imsi+" to number "+sms.dest+" because destination is offline. Waiting 5 minutes before trying again.");
-
-		// Reschedule after 5s
-		onInterval.nextIdle = (Date.now() / 1000) + 5;
-		return;
-	    }
-
-	    res = mtLocalDelivery(sms);
-	    if (res==false) {
-		sms.tries = sms.tries - 1;
-		if (sms.tries>=0) {
-		    // if number of attempts to deliver wasn't excedeed push it on last position
-		    // add sms at the end of pending SMSs
-		    sms.next_try = (Date.now() / 1000) + 5; // current time + 5 seconds 
-		    pendingSMSs.push(sms);
-		    Engine.debug(Engine.DebugInfo,"Could not deliver sms from imsi "+sms.imsi+" to number "+sms.dest+".");
-		} else
-		    Engine.debug(Engine.DebugInfo,"Droped sms from imsi "+sms.imsi+" to number "+sms.dest+". Exceeded attempts.");
-	    } else
-		Engine.debug(Engine.DebugInfo,"Delivered sms from imsi "+sms.imsi+" to number "+sms.dest);
+    for (var i=0; i<pendingSMSs.length; i++) {
+	if (pendingSMSs[i].next_try<=now) {
+	    var sms = pendingSMSs[i];
+	    pendingSMSs.splice(i,1);
 	}
     }
 
+    if (sms!=undefined) {
+
+	// make sure destination subscriber is registered
+	var loc = registered_subscribers[sms.dest_imsi]["location"];
+	if (loc=="") {
+	    sms.next_try = now + 300; // current time + 5 minutes
+	    pendingSMSs.push(sms);
+	    Engine.debug(Engine.DebugInfo,"Did not deliver sms from imsi "+sms.imsi+" to number "+sms.dest+" because destination is offline. Waiting 5 minutes before trying again.");
+
+	    // Reschedule after 5s
+	    onInterval.nextIdle = now + 5;
+	    return;
+	}
+
+	res = mtLocalDelivery(sms);
+	if (res==false) {
+	    sms.tries = sms.tries - 1;
+	    if (sms.tries>=0) {
+		// if number of attempts to deliver wasn't excedeed push it on last position
+		// add sms at the end of pending SMSs
+		sms.next_try = now + 5; 
+		pendingSMSs.push(sms);
+		Engine.debug(Engine.DebugInfo,"Could not deliver sms from imsi "+sms.imsi+" to number "+sms.dest+".");
+	    } else
+	        Engine.debug(Engine.DebugInfo,"Droped sms from imsi "+sms.imsi+" to number "+sms.dest+". Exceeded attempts.");
+	} else
+	    Engine.debug(Engine.DebugInfo,"Delivered sms from imsi "+sms.imsi+" to number "+sms.dest);
+    }
+
+    if (now%100<5) {
+
+	// see if we should expire TMSIs
+	for (var imsi_key in registered_subscribers) {
+	    if (now>=registered_subscribers[imsi_key]["expires"]) {
+		Engine.debug(Engine.DebugInfo, "Expiring subscriber "+imsi_key+". now="+now+", expire="+registered_subscribers[imsi_key]["expires"]);
+		delete registered_subscribers[imsi_key];
+		saveUE(imsi_key);
+	    }
+	}
+
+    }
+  
     // Reschedule after 5s
-    onInterval.nextIdle = (Date.now() / 1000) + 5;
+    onInterval.nextIdle = now + 5;
 }
 
 // Deliver SMS to registered MS in MT format
@@ -788,11 +825,10 @@ function onSMS(msg)
     if (msisdn==false) {
 	// Unidentified subscriber
 	msg.error = "28";
-	return true;
+	return false;
     }
 
-    dest = msg["sms.called"];
-
+    var dest = msg["sms.called"];
     if (dest==eliza_number)
 	return onElizaSMS(msg, imsi, dest, msisdn);
 
@@ -800,14 +836,14 @@ function onSMS(msg)
 
     // check if short number was used
     dest = isShortNumber(dest);
-    dest_imsi = getSubscriberIMSI(dest);
-
+    var dest_imsi = getSubscriberIMSI(dest);
     if (dest_imsi==false) {
-	msg.error = "noroute";
-	return true;
+	msg.error = "1"; // Unassigned (unallocated) number
+	return false;
     }
-    
-    var sms = {"imsi":imsi, "msisdn":msisdn, "smsc":msg.called, "dest":dest, "dest_imsi":dest_imsi, "next_try":Date.now(), "tries":sms_attempts, "msg":msg.text };
+   
+    var next_try = Date.now()/1000; 
+    var sms = {"imsi":imsi, "msisdn":msisdn, "smsc":msg.called, "dest":dest, "dest_imsi":dest_imsi, "next_try":next_try, "tries":sms_attempts, "msg":msg.text };
 
     pendingSMSs.push(sms);
     return true;
@@ -1280,6 +1316,11 @@ function onCommand(msg)
 	case "nib reload":
 	    updateSubscribersInfo();
 	    msg.retValue("Finished updating subscribers.\r\n");
+	    return true;
+
+	case "nib":
+	case "nib list":
+	    msg.retValue("Incomplete command!\r\n");
 	    return true;
     }
 
