@@ -1,0 +1,3 @@
+RewriteEngine On
+RewriteBase /nipc
+RewriteRule .* index.php  [L]
